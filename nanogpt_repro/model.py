@@ -16,20 +16,28 @@ class AttentionBlock(nn.Module):
         self.dropout_attn_weights = nn.Dropout(cfg.dropout_rate_attn_weights)
         mask = torch.ones((cfg.max_seq_len, cfg.max_seq_len)).tril()
         self.register_buffer('mask', mask, persistent=False)
+        self.kv_cache = None
 
-    def forward(self, x):
-        assert len(x.shape) == 3
-        B, T, D = x.shape
+    def forward(self, x: torch.Tensor, use_kv_cache: bool = True) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError(
+                f'x should have shape (B, T, D) with B batch size, T sequence length and D embedding dim. Got {x.shape}'
+            )
+        B, T_new, D = x.shape
         q, k, v = self.c_attn(x).chunk(3, dim=-1)
         H = self.cfg.D // self.cfg.N
-        q = q.view((B, T, self.cfg.N, H))
-        k = k.view((B, T, self.cfg.N, H))
-        v = v.view((B, T, self.cfg.N, H))
+        q = q.view((B, T_new, self.cfg.N, H))
+        k = k.view((B, T_new, self.cfg.N, H))
+        v = v.view((B, T_new, self.cfg.N, H))
+        if self.kv_cache is not None:
+            k = torch.cat((self.kv_cache[0], k), dim=1)
+            v = torch.cat((self.kv_cache[1], v), dim=1)
+        self.kv_cache = torch.stack((k, v), dim=0)
         unnorm_weights = torch.einsum('btnh, bsnh -> btsn', q, k) / H ** 0.5
-        unnorm_weights = torch.masked_fill(unnorm_weights, torch.logical_not(self.mask.to(dtype=x.dtype, device=x.device)[None, :T, :T, None]),
+        unnorm_weights = torch.masked_fill(unnorm_weights, torch.logical_not(self.mask.to(dtype=x.dtype, device=x.device)[None, :T_new, :T_new, None]),
                                            float("-inf"))
         norm_weights = self.dropout_attn_weights(F.softmax(unnorm_weights, dim=2))
-        weighted_sum = torch.einsum('btsn, bsnh -> btnh', norm_weights, v).reshape(B, T, D)
+        weighted_sum = torch.einsum('btsn, bsnh -> btnh', norm_weights, v).reshape(B, T_new, D)
         output = self.dropout_c_proj(self.c_proj(weighted_sum))
         return output
 
